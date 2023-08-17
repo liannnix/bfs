@@ -1,33 +1,37 @@
 #!/hint/bash
 
+# Copyright © Tavian Barnes <tavianator@tavianator.com>
+# SPDX-License-Identifier: 0BSD
+
+CHROMIUM_URL="https://github.com/chromium/chromium.git"
+CHROMIUM_TAG=118.0.5954.1
+
+LINUX_URL="https://github.com/torvalds/linux.git"
 LINUX_TAG=v6.4
 
-# Clone the Linux source tree
-clone-linux() {
-    if ! [ -e bench/corpus/linux.git ]; then
-        echo "Cloning Linux..."
-        as-user git clone --bare --progress "https://github.com/torvalds/linux.git" bench/corpus/linux.git
-    fi
+LLVM_URL="https://github.com/llvm/llvm-project.git"
+LLVM_TAG=llvmorg-16.0.6
 
-    (
-        echo "Fetching Linux $LINUX_TAG..."
-        cd bench/corpus/linux.git
-        as-user git fetch origin tag "$LINUX_TAG" --no-tags
-    )
+RUST_URL="https://github.com/rust-lang/rust.git"
+RUST_TAG=1.71.0
 
-    if [ -e bench/corpus/linux ]; then
-        (
-            echo "Checking out Linux $LINUX_TAG.."
-            cd bench/corpus/linux
-            as-user git checkout v6.4
-        )
-    else
-        (
-            echo "Creating Linux worktree..."
-            cd bench/corpus/linux.git
-            as-user git worktree add -d ../linux v6.4
-        )
-    fi
+# Get the url of a corpus
+corpus-url() {
+    local var="${1^^}_URL"
+    printf '%s' "${!var}"
+}
+
+# Get the tag of a corpus
+corpus-tag() {
+    local var="${1^^}_TAG"
+    printf '%s' "${!var}"
+}
+
+# Get the directory of a corpus
+corpus-dir() {
+    local var="${1^^}_URL"
+    local base="${!var##*/}"
+    printf 'bench/corpus/%s' "${base%.git}"
 }
 
 # Set up the benchmarks
@@ -38,29 +42,62 @@ setup() {
         exit $EX_USAGE
     fi
 
-    export LINUX=0
-
     export FD=0
     export FIND=0
+
+    export COMPLETE=""
+    export EARLY_QUIT=""
+    export PRINT=""
+    export STRATEGIES=""
 
     nproc=$(nproc)
     commits=()
 
     for arg; do
         case "$arg" in
+            # Utilities to benchmark against
             --fd)
                 FD=1
                 ;;
             --find)
                 FIND=1
                 ;;
-            --linux)
-                LINUX=1
+            # Benchmark groups
+            --complete)
+                COMPLETE="rust linux llvm chromium"
+                ;;
+            --complete=*)
+                COMPLETE="${arg#*=}"
+                ;;
+            --early-quit)
+                EARLY_QUIT=chromium
+                ;;
+            --early-quit=*)
+                EARLY_QUIT="${arg#*=}"
+                ;;
+            --print)
+                PRINT=linux
+                ;;
+            --print=*)
+                PRINT="${arg#*=}"
+                ;;
+            --strategies)
+                STRATEGIES=linux
+                ;;
+            --strategies=*)
+                STRATEGIES="${arg#*=}"
+                ;;
+            --default)
+                COMPLETE="rust linux llvm chromium"
+                EARLY_QUIT=chromium
+                PRINT=linux
+                STRATEGIES=linux
                 ;;
             -*)
                 printf 'Unknown option %q\n' "$arg" >&2
                 exit $EX_USAGE
                 ;;
+            # bfs commits/tags to benchmark
             *)
                 commits+=("$arg")
                 ;;
@@ -71,11 +108,16 @@ setup() {
         max-freq
     fi
 
+    echo "Building bfs..."
+    as-user make -s -j"$nproc" all
+
     as-user mkdir -p bench/corpus
 
-    if ((LINUX)); then
-        clone-linux
-    fi
+    read -a corpuses <<<"$COMPLETE $EARLY_QUIT $PRINT $STRATEGIES"
+    corpuses=($(printf '%s\n' "${corpuses[@]}" | sort -u))
+    for corpus in "${corpuses[@]}"; do
+        as-user ./bench/clone-tree.sh "$(corpus-url $corpus)" "$(corpus-tag $corpus)" "$(corpus-dir $corpus)"
+    done
 
     if ((${#commits[@]} > 0)); then
         echo "Creating bfs worktree..."
@@ -105,9 +147,6 @@ setup() {
         at-exit rm "$tmp"
         export PATH="$tmp:$PATH"
     fi
-
-    echo "Building bfs..."
-    as-user make -s -j"$nproc"
 
     if ((UID == 0)); then
         turbo-off
@@ -145,8 +184,10 @@ subsubgroup() {
 
 # Benchmark the complete traversal of a directory tree
 # (without printing anything)
-bench-complete() {
-    subgroup "$1"
+bench-complete-corpus() {
+    total=$(./bin/bfs "$2" -printf '.' | wc -c)
+
+    subgroup "$1 ($total files)"
 
     cmds=()
     for exe in "${exes[@]}"; do
@@ -165,20 +206,20 @@ bench-complete() {
 }
 
 # All complete traversal benchmarks
-bench-complete-group() {
+bench-complete() {
     group "Complete traversal"
 
-    if ((LINUX)); then
-        bench-complete "Linux $LINUX_TAG source tree" bench/corpus/linux
-    fi
+    for corpus; do
+        bench-complete-corpus "$corpus $(corpus-tag $corpus)" "$(corpus-dir $corpus)"
+    done
 }
 
 # Benchmark quiting as soon as a file is seen
-bench-early-quit() {
-    subgroup "$1"
-
+bench-early-quit-corpus() {
     dir="$2"
     max_depth=$(./bin/bfs -S ids -j1 "$dir" -depth -type f -printf '%d\n' -quit)
+
+    subgroup "$1 (depth $max_depth)"
 
     for ((i = 5; i <= max_depth; i += 5)); do
         subsubgroup "Depth $i"
@@ -208,12 +249,87 @@ bench-early-quit() {
 }
 
 # All early-quitting benchmarks
-bench-early-quit-group() {
+bench-early-quit() {
     group "Early termination"
 
-    if ((LINUX)); then
-        bench-early-quit "Linux $LINUX_TAG source tree" bench/corpus/linux
+    for corpus; do
+        bench-early-quit-corpus "$corpus $(corpus-tag $corpus)" "$(corpus-dir $corpus)"
+    done
+}
+
+# Benchmark printing paths without colors
+bench-print-nocolor() {
+    subsubgroup "$1"
+
+    cmds=()
+    for exe in "${exes[@]}"; do
+        cmds+=("$exe $2")
+    done
+
+    if ((FIND)); then
+        cmds+=("find $2")
     fi
+
+    if ((FD)); then
+        cmds+=("fd -u --search-path $2")
+    fi
+
+    do-hyperfine "${cmds[@]}"
+}
+
+# Benchmark printing paths with colors
+bench-print-color() {
+    subsubgroup "$1"
+
+    cmds=()
+    for exe in "${exes[@]}"; do
+        cmds+=("$exe $2 -color")
+    done
+
+    if ((FD)); then
+        cmds+=("fd -u --search-path $2 --color=always")
+    fi
+
+    do-hyperfine "${cmds[@]}"
+}
+
+# All printing benchmarks
+bench-print() {
+    group "Printing paths"
+
+    subgroup "Without colors"
+    for corpus; do
+        bench-print-nocolor "$corpus $(corpus-tag $corpus)" "$(corpus-dir $corpus)"
+    done
+
+    subgroup "With colors"
+    for corpus; do
+        bench-print-color "$corpus $(corpus-tag $corpus)" "$(corpus-dir $corpus)"
+    done
+}
+
+# Benchmark a search strategy
+bench-strategy() {
+    subsubgroup "$1"
+
+    cmds=()
+    for exe in "${exes[@]}"; do
+        cmds+=("$exe -S $3 $2")
+    done
+
+    do-hyperfine "${cmds[@]}"
+}
+
+# All search strategy benchmarks
+bench-strategies() {
+    group "Search strategies"
+
+    for strat in dfs ids eds; do
+        subgroup "$strat"
+        for corpus; do
+            bench-strategy "$corpus $(corpus-tag $corpus)" "$(corpus-dir $corpus)" "$strat"
+        done
+    done
 }
 
 # Run all the benchmarks
@@ -225,6 +341,16 @@ bench() {
         fi
     done
 
-    bench-complete-group
-    bench-early-quit-group
+    if [[ $COMPLETE ]]; then
+        bench-complete $COMPLETE
+    fi
+    if [[ $EARLY_QUIT ]]; then
+        bench-early-quit $EARLY_QUIT
+    fi
+    if [[ $PRINT ]]; then
+        bench-print $PRINT
+    fi
+    if [[ $STRATEGIES ]]; then
+        bench-strategies $STRATEGIES
+    fi
 }
